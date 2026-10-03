@@ -1,5 +1,8 @@
+import getpass
 import os
 import shlex
+import shutil
+import subprocess
 from pathlib import Path
 
 import uvicorn
@@ -33,11 +36,53 @@ class ShellCommandRequest(BaseModel):
     tail: int = Field(default=100, ge=1, le=1000)
 
 
+def run_power_command(command: str) -> dict[str, object]:
+    command_path = shutil.which(command) or f"/usr/sbin/{command}"
+
+    process = subprocess.run(
+        ["sudo", "-n", command_path],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    if process.returncode != 0:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "command": command,
+                "output": process.stdout,
+                "error": process.stderr.strip(),
+                "hint": (
+                    "This API runs without an interactive terminal. Configure "
+                    f"passwordless sudo for this command, for example: "
+                    f"{getpass.getuser()} ALL=(root) NOPASSWD: {command_path}"
+                ),
+            },
+        )
+
+    return {
+        "command": command_path,
+        "output": process.stdout,
+        "error": process.stderr,
+    }
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {
         "status": "ok"
     }
+
+
+@app.get("/poweroff")
+def poweroff() -> dict[str, object]:
+    return run_power_command("poweroff")
+
+
+@app.get("/reboot")
+def reboot() -> dict[str, object]:
+    return run_power_command("reboot")
 
 
 @app.post("/run-shell-command")
