@@ -1,10 +1,15 @@
 import json
 import os
+import re
+from pathlib import Path
 from typing import Any
 
+import arxiv
+import requests
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from pypdf import PdfReader
 from agno.tools.arxiv import ArxivTools
 from agno.tools.email import EmailTools
 from agno_email_agent import load_email_variables
@@ -13,6 +18,7 @@ API_HOST = os.getenv("ARXIV_EMAIL_API_HOST", "127.0.0.1")
 API_PORT = int(os.getenv("ARXIV_EMAIL_API_PORT", "8000"))
 DEFAULT_ARTICLE_COUNT = int(os.getenv("ARXIV_EMAIL_ARTICLE_COUNT", "5"))
 DEFAULT_MAX_PAPER_CHARS = int(os.getenv("ARXIV_EMAIL_MAX_PAPER_CHARS", "20000"))
+PDF_DOWNLOAD_DIR = Path(os.getenv("ARXIV_EMAIL_PDF_DIR", "/tmp/agno_arxiv_pdfs"))
 
 app = FastAPI(title="ArXiv Email API")
 
@@ -40,12 +46,68 @@ def search_arxiv(topic: str, num_articles: int) -> list[dict[str, Any]]:
 
 
 def read_arxiv_papers(paper_ids: list[str], pages_to_read: int | None) -> list[dict[str, Any]]:
-    arxiv_tools = ArxivTools(enable_search_arxiv=False)
-    result = arxiv_tools.read_arxiv_papers(
-        id_list=paper_ids,
-        pages_to_read=pages_to_read,
-    )
-    return json.loads(result)
+    client = arxiv.Client()
+    search = arxiv.Search(id_list=paper_ids)
+    papers = []
+    PDF_DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    for result in client.results(search=search):
+        paper = {
+            "title": result.title,
+            "id": result.get_short_id(),
+            "entry_id": result.entry_id,
+            "authors": [author.name for author in result.authors],
+            "primary_category": result.primary_category,
+            "categories": result.categories,
+            "published": result.published.isoformat() if result.published else None,
+            "pdf_url": result.pdf_url,
+            "links": [link.href for link in result.links],
+            "summary": result.summary,
+            "comment": result.comment,
+            "content": [],
+        }
+
+        if result.pdf_url:
+            pdf_path = download_pdf(result.pdf_url, result.get_short_id())
+            pdf_reader = PdfReader(pdf_path)
+            for page_number, page in enumerate(pdf_reader.pages, start=1):
+                if pages_to_read and page_number > pages_to_read:
+                    break
+                paper["content"].append(
+                    {
+                        "page": page_number,
+                        "text": page.extract_text() or "",
+                    }
+                )
+
+        papers.append(paper)
+
+    return papers
+
+
+def download_pdf(pdf_url: str, paper_id: str) -> Path:
+    safe_paper_id = re.sub(r"[^a-zA-Z0-9_.-]", "_", paper_id)
+    pdf_path = PDF_DOWNLOAD_DIR / f"{safe_paper_id}.pdf"
+    response = requests.get(pdf_url, timeout=60)
+    response.raise_for_status()
+    pdf_path.write_bytes(response.content)
+    return pdf_path
+
+
+def normalize_arxiv_id(paper_id: str) -> str:
+    return re.sub(r"v\d+$", "", paper_id.strip())
+
+
+def read_arxiv_papers_with_fallback(paper_ids: list[str], pages_to_read: int | None) -> list[dict[str, Any]]:
+    papers = read_arxiv_papers(paper_ids=paper_ids, pages_to_read=pages_to_read)
+    if papers:
+        return papers
+
+    normalized_paper_ids = [normalize_arxiv_id(paper_id) for paper_id in paper_ids]
+    if normalized_paper_ids == paper_ids:
+        return papers
+
+    return read_arxiv_papers(paper_ids=normalized_paper_ids, pages_to_read=pages_to_read)
 
 
 def build_email(topic: str, articles: list[dict[str, Any]]) -> tuple[str, str]:
@@ -163,7 +225,7 @@ def read_paper_markdown_and_send(
     receiver_email: str | None = None,
 ) -> dict[str, Any]:
     cleaned_paper_ids = [paper_id.strip() for paper_id in paper_ids if paper_id.strip()]
-    papers = read_arxiv_papers(paper_ids=cleaned_paper_ids, pages_to_read=pages_to_read)
+    papers = read_arxiv_papers_with_fallback(paper_ids=cleaned_paper_ids, pages_to_read=pages_to_read)
     subject, body = build_paper_markdown_email(
         paper_ids=cleaned_paper_ids,
         papers=papers,
