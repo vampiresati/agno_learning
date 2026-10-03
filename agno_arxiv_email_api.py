@@ -12,6 +12,7 @@ from agno_email_agent import load_email_variables
 API_HOST = os.getenv("ARXIV_EMAIL_API_HOST", "127.0.0.1")
 API_PORT = int(os.getenv("ARXIV_EMAIL_API_PORT", "8000"))
 DEFAULT_ARTICLE_COUNT = int(os.getenv("ARXIV_EMAIL_ARTICLE_COUNT", "5"))
+DEFAULT_MAX_PAPER_CHARS = int(os.getenv("ARXIV_EMAIL_MAX_PAPER_CHARS", "20000"))
 
 app = FastAPI(title="ArXiv Email API")
 
@@ -22,11 +23,27 @@ class ArxivEmailRequest(BaseModel):
     receiver_email: str | None = None
 
 
+class PaperMarkdownEmailRequest(BaseModel):
+    paper_ids: list[str] = Field(..., min_length=1)
+    pages_to_read: int | None = Field(default=3, ge=1, le=50)
+    max_chars: int = Field(default=DEFAULT_MAX_PAPER_CHARS, ge=1000, le=100000)
+    receiver_email: str | None = None
+
+
 def search_arxiv(topic: str, num_articles: int) -> list[dict[str, Any]]:
     arxiv_tools = ArxivTools(enable_read_arxiv_papers=False)
     result = arxiv_tools.search_arxiv_and_return_articles(
         query=topic,
         num_articles=num_articles,
+    )
+    return json.loads(result)
+
+
+def read_arxiv_papers(paper_ids: list[str], pages_to_read: int | None) -> list[dict[str, Any]]:
+    arxiv_tools = ArxivTools(enable_search_arxiv=False)
+    result = arxiv_tools.read_arxiv_papers(
+        id_list=paper_ids,
+        pages_to_read=pages_to_read,
     )
     return json.loads(result)
 
@@ -58,6 +75,52 @@ def build_email(topic: str, articles: list[dict[str, Any]]) -> tuple[str, str]:
         )
 
     return subject, "\n".join(lines).strip()
+
+
+def build_paper_markdown_email(
+    paper_ids: list[str],
+    papers: list[dict[str, Any]],
+    max_chars: int,
+) -> tuple[str, str]:
+    subject = f"ArXiv paper markdown: {', '.join(paper_ids)}"
+    if not papers:
+        return subject, f"No arXiv papers were found for IDs: {', '.join(paper_ids)}"
+
+    sections = [f"# ArXiv Paper Markdown\n\nRequested IDs: {', '.join(paper_ids)}"]
+    for paper in papers:
+        authors = ", ".join(paper.get("authors", [])) or "Unknown authors"
+        sections.extend(
+            [
+                f"## {paper.get('title', 'Untitled')}",
+                f"- **ID:** {paper.get('id') or 'Unknown'}",
+                f"- **Authors:** {authors}",
+                f"- **Published:** {paper.get('published') or 'Unknown'}",
+                f"- **PDF:** {paper.get('pdf_url') or 'No PDF URL'}",
+                "",
+                "### Abstract",
+                paper.get("summary") or "No abstract available.",
+                "",
+            ]
+        )
+
+        pages = paper.get("content", [])
+        if pages:
+            sections.append("### Extracted Paper Text")
+            for page in pages:
+                page_number = page.get("page", "Unknown")
+                page_text = " ".join((page.get("text") or "").split())
+                sections.extend(
+                    [
+                        "",
+                        f"#### Page {page_number}",
+                        page_text or "No text extracted from this page.",
+                    ]
+                )
+
+    body = "\n".join(sections).strip()
+    if len(body) > max_chars:
+        body = f"{body[:max_chars]}\n\n[Truncated to {max_chars} characters.]"
+    return subject, body
 
 
 def send_email(subject: str, body: str, receiver_email: str | None = None) -> str:
@@ -93,6 +156,39 @@ def search_and_send(topic: str, num_articles: int, receiver_email: str | None = 
     }
 
 
+def read_paper_markdown_and_send(
+    paper_ids: list[str],
+    pages_to_read: int | None,
+    max_chars: int,
+    receiver_email: str | None = None,
+) -> dict[str, Any]:
+    cleaned_paper_ids = [paper_id.strip() for paper_id in paper_ids if paper_id.strip()]
+    papers = read_arxiv_papers(paper_ids=cleaned_paper_ids, pages_to_read=pages_to_read)
+    subject, body = build_paper_markdown_email(
+        paper_ids=cleaned_paper_ids,
+        papers=papers,
+        max_chars=max_chars,
+    )
+    email_status = send_email(subject=subject, body=body, receiver_email=receiver_email)
+    return {
+        "paper_ids": cleaned_paper_ids,
+        "num_papers": len(papers),
+        "pages_to_read": pages_to_read,
+        "email_status": email_status,
+        "subject": subject,
+        "papers": [
+            {
+                "title": paper.get("title"),
+                "id": paper.get("id"),
+                "pdf_url": paper.get("pdf_url"),
+                "published": paper.get("published"),
+                "pages_extracted": len(paper.get("content", [])),
+            }
+            for paper in papers
+        ],
+    }
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -104,6 +200,27 @@ def send_arxiv_email(request: ArxivEmailRequest) -> dict[str, Any]:
         result = search_and_send(
             topic=request.topic.strip(),
             num_articles=request.num_articles,
+            receiver_email=request.receiver_email.strip() if request.receiver_email else None,
+        )
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
+
+    if result["email_status"] != "email sent successfully":
+        raise HTTPException(status_code=502, detail=result)
+    return result
+
+
+@app.post("/send-arxiv-paper-email")
+def send_arxiv_paper_email(request: PaperMarkdownEmailRequest) -> dict[str, Any]:
+    paper_ids = [paper_id.strip() for paper_id in request.paper_ids if paper_id.strip()]
+    if not paper_ids:
+        raise HTTPException(status_code=400, detail="paper_ids must include at least one paper ID")
+
+    try:
+        result = read_paper_markdown_and_send(
+            paper_ids=paper_ids,
+            pages_to_read=request.pages_to_read,
+            max_chars=request.max_chars,
             receiver_email=request.receiver_email.strip() if request.receiver_email else None,
         )
     except Exception as error:
