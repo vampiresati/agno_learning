@@ -3,8 +3,19 @@ from dotenv import load_dotenv
 from agno.agent import Agent
 from agno.models.ollama import Ollama
 from agno.tools.email import EmailTools
+# Phoenix imports
+from phoenix.otel import register
 load_dotenv()
-email_agent_name="My AI Email Agent"
+os.environ["PHOENIX_COLLECTOR_ENDPOINT"] = (
+    "http://localhost:6006"
+)
+tracer_provider = register(
+    project_name="agno-email-agent",
+    auto_instrument=True,
+)
+print("Phoenix tracing initialized")
+print("Phoenix UI: http://localhost:6006")
+email_agent_name = "My AI Email Agent"
 def load_email_variables():
     receiver_email = os.getenv("RECEIVER_EMAIL")
     sender_email = os.getenv("SENDER_EMAIL")
@@ -33,6 +44,7 @@ email_agent = Agent(
         "Do not send an email unless the user explicitly asks you to send one.",
     ],
     markdown=True,
+    debug_mode=True,
 )
 
 if __name__ == "__main__":
